@@ -41,7 +41,7 @@ use reth_payload_builder_primitives::PayloadBuilderError;
 use reth_payload_primitives::{BuildNextEnv, BuiltPayloadExecutedBlock};
 use reth_payload_util::{BestPayloadTransactions, NoopPayloadTransactions, PayloadTransactions};
 use reth_primitives_traits::{
-    HeaderTy, NodePrimitives, SealedHeader, SealedHeaderFor, SignedTransaction, TxTy,
+    HeaderTy, NodePrimitives, ReceiptTy, SealedHeader, SealedHeaderFor, SignedTransaction, TxTy,
 };
 use reth_revm::{
     cancelled::CancelOnDrop, database::StateProviderDatabase, db::State,
@@ -501,6 +501,7 @@ impl<Txs> OpBuilder<'_, Txs> {
                     RethPayloadTransactions(best_txs),
                     None,
                     None,
+                    None,
                 )?
                 .is_some()
             {
@@ -629,6 +630,50 @@ pub struct CommittedTxGas {
     /// Settlement only rebates today, so this is `>= canonical_gas_used`; refunds return gas
     /// but not build time, which is why block-limit admission is gated on this figure.
     pub evm_gas_used: u64,
+}
+
+/// A transaction that has been committed to the block under construction, together with
+/// the receipt the block will carry for it.
+///
+/// Borrowed rather than owned: the observer runs inline on the build path and the builder
+/// still owns both values. An observer that needs either past the call must clone it.
+#[derive(Debug)]
+pub struct CommittedTx<'a, N: NodePrimitives> {
+    /// Index of this transaction within the block.
+    pub index: u64,
+    /// The committed transaction, with its recovered signer.
+    pub tx: &'a Recovered<TxTy<N>>,
+    /// The receipt as committed — status, logs, and block-cumulative gas.
+    pub receipt: &'a ReceiptTy<N>,
+    /// Gas this transaction used, in both of the senses a block builder needs.
+    pub gas: CommittedTxGas,
+}
+
+/// Observes transactions as they are committed to the block under construction.
+///
+/// [`Self::on_committed_tx`] is invoked once per committed transaction, in commit order,
+/// **after** its state changes and receipt have landed in the block. It is not invoked for
+/// transactions that are skipped, rejected, or fail execution.
+///
+/// # This runs on the block building critical path
+///
+/// The call is synchronous, between transactions, and sits ahead of the next
+/// between-transaction cancellation check — so a slow observer directly delays how quickly
+/// an in-flight build reacts to `getPayload` or job cancellation. Implementations must not
+/// block: record what they need and return. Anything expensive (serialization, I/O,
+/// contended locks) belongs on the far side of a non-blocking channel.
+///
+/// Any `FnMut(CommittedTx<'_, N>)` implements this via the blanket impl below, so callers
+/// can pass a closure directly.
+pub trait OnCommittedTx<N: NodePrimitives> {
+    /// Called once for each transaction committed to the block.
+    fn on_committed_tx(&mut self, committed: CommittedTx<'_, N>);
+}
+
+impl<N: NodePrimitives, F: for<'a> FnMut(CommittedTx<'a, N>)> OnCommittedTx<N> for F {
+    fn on_committed_tx(&mut self, committed: CommittedTx<'_, N>) {
+        self(committed)
+    }
 }
 
 /// A [`PayloadTransactions`] iterator that is notified of the gas used by each
@@ -1059,6 +1104,11 @@ where
     /// transaction, in commit order, with the gas it used, so a custom iterator can
     /// maintain its own per-inclusion state. A plain [`PayloadTransactions`] satisfies
     /// the trait via [`RethPayloadTransactions`], where `on_commit` is a no-op.
+    ///
+    /// When `on_committed` is `Some(observer)`, [`OnCommittedTx::on_committed_tx`] is called
+    /// once per committed transaction, in commit order, after its state changes and receipt
+    /// have landed in the block. `None` skips the notification entirely. The observer runs
+    /// inline on the build path — see [`OnCommittedTx`] for what that forbids.
     pub fn execute_best_transactions<Builder>(
         &self,
         info: &mut ExecutionInfo,
@@ -1068,6 +1118,7 @@ where
         >,
         gas_limit_cap: Option<u64>,
         mut committed_txs: Option<&mut Vec<Recovered<TxTy<Evm::Primitives>>>>,
+        mut on_committed: Option<&mut dyn OnCommittedTx<Evm::Primitives>>,
     ) -> Result<Option<()>, PayloadBuilderError>
     where
         Builder: BlockBuilder<Primitives = Evm::Primitives>,
@@ -1197,7 +1248,29 @@ where
             // Report the gas used by each committed transaction so a custom
             // `best_txs` can update its own per-inclusion state. `RethPayloadTransactions`
             // makes this a no-op for a plain `PayloadTransactions`.
-            best_txs.on_commit(CommittedTxGas { canonical_gas_used: tx_gas_used, evm_gas_used });
+            let gas = CommittedTxGas { canonical_gas_used: tx_gas_used, evm_gas_used };
+            best_txs.on_commit(gas);
+
+            // Notify a per-transaction observer now that the state changes and the receipt
+            // are committed. The receipt is the last one the executor pushed, so an empty
+            // receipt list would mean the commit did not happen — impossible here, since
+            // `commit_transaction` is infallible and always appends, but skipping rather
+            // than indexing keeps this free of a panic path.
+            if let Some(observer) = on_committed.as_deref_mut() {
+                let receipts = builder.executor().receipts();
+                if let Some((index, receipt)) = receipts
+                    .len()
+                    .checked_sub(1)
+                    .and_then(|index| Some((index, receipts.get(index)?)))
+                {
+                    observer.on_committed_tx(CommittedTx {
+                        index: index as u64,
+                        tx: &tx,
+                        receipt,
+                        gas,
+                    });
+                }
+            }
 
             // Record the successfully committed transaction for callers that want per-call
             // visibility.

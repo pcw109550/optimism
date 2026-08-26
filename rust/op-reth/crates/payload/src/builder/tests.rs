@@ -263,7 +263,8 @@ where
             &mut builder,
             RethPayloadTransactions(best_txs),
             gas_limit_cap,
-            committed_txs
+            committed_txs,
+            None
         )
         .expect("best transactions execute")
         .is_none()
@@ -554,7 +555,7 @@ fn execute_best_transactions_on_commit_hook_execution() {
         committed_txs_gas: committed_txs_gas.clone(),
     };
 
-    ctx.execute_best_transactions(&mut info, &mut builder, best_txs, None, None)
+    ctx.execute_best_transactions(&mut info, &mut builder, best_txs, None, None, None)
         .expect("best transactions execute");
 
     let distinct_gas: std::collections::HashSet<u64> =
@@ -648,7 +649,7 @@ fn on_commit_reports_canonical_and_pre_refund_gas_separately_under_sdm_refund() 
     let best_txs =
         RefundProbe { inner: PayloadTransactionsFixed::new(vec![tx]), reported: reported.clone() };
 
-    ctx.execute_best_transactions(&mut info, &mut builder, best_txs, None, None)
+    ctx.execute_best_transactions(&mut info, &mut builder, best_txs, None, None, None)
         .expect("best transactions execute");
 
     let reported = reported.borrow();
